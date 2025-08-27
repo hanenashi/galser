@@ -71,7 +71,67 @@ def display_label(path):
 
 # ===== GAL:BEGIN_DYNAMIC_ROOT =====
 CURRENT_ROOT  = _real(os.getcwd())
-ALLOWED_BASES = termux_candidates()
+
+def is_android_env():
+    # Heuristic: typical Termux/Android paths exist
+    return os.path.isdir('/storage/emulated/0') or os.path.isdir(_real('~/storage/shared'))
+
+def windows_drive_roots():
+    roots=[]
+    # Probe A: to Z:
+    for code in range(ord('A'), ord('Z')+1):
+        d = f"{chr(code)}:\\"
+        try:
+            if os.path.isdir(d):
+                roots.append(_real(d))
+        except Exception:
+            pass
+    return roots
+
+def posix_roots():
+    roots = [_real('/')]
+    # Common macOS external mounts:
+    if os.path.isdir('/Volumes'):
+        try:
+            with os.scandir('/Volumes') as it:
+                for e in it:
+                    if e.is_dir():
+                        roots.append(_real(os.path.join('/Volumes', e.name)))
+        except Exception:
+            pass
+    return roots
+
+def desktop_candidates():
+    seeds = []
+    if os.name == 'nt':
+        seeds.extend(windows_drive_roots())
+        # nice-to-haves:
+        seeds.extend([
+            _real(os.getcwd()),
+            _real(os.path.expanduser('~')),
+            _real(os.path.join(os.path.expanduser('~'), 'Pictures')),
+            _real(os.path.join(os.path.expanduser('~'), 'Downloads')),
+        ])
+    else:
+        # POSIX
+        seeds.extend(posix_roots())
+        seeds.extend([
+            _real(os.getcwd()),
+            _real(os.path.expanduser('~')),
+            _real(os.path.join(os.path.expanduser('~'), 'Pictures')),
+            _real(os.path.join(os.path.expanduser('~'), 'Downloads')),
+            _real('/mnt'),
+            _real('/media'),
+        ])
+    # de-dup keep order
+    uniq, seen = [], set()
+    for p in seeds:
+        if os.path.isdir(p):
+            if p not in seen:
+                uniq.append(p); seen.add(p)
+    return uniq
+
+ALLOWED_BASES = termux_candidates() if is_android_env() else desktop_candidates()
 
 def is_subpath(child, base):
     try:
@@ -863,16 +923,18 @@ def roots_template():
   :root { --bg:#111; --fg:#eee; --muted:#aaa; }
   * { box-sizing:border-box; }
   body { margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans", Arial, sans-serif; background:var(--bg); color:var(--fg); }
-  header { padding:14px 18px; border-bottom:1px solid #222; display:flex; gap:10px; align-items:center; }
+  header { padding:14px 18px; border-bottom:1px solid #222; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   header .title { font-weight:700; font-size:18px; }
   a.btn { color:var(--fg); text-decoration:none; background:#222; padding:10px 14px; border-radius:12px; border:1px solid #333; font-size:16px; }
   .wrap { padding:14px 18px; }
   .row { display:flex; gap:12px; align-items:center; border:1px solid #222; border-radius:12px; padding:12px 14px; margin:12px 0; background:#1a1a1a; }
   .row .path { flex:1; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; color:#ddd; overflow:auto; font-size:16px; }
-  .row .actions { display:flex; gap:10px; }
-  .toolbar { display:flex; gap:10px; margin:10px 0 16px; }
+  .row .actions { display:flex; gap:10px; flex-wrap:wrap; }
+  .toolbar { display:flex; gap:10px; margin:10px 0 16px; flex-wrap:wrap; }
   .current { font-family:ui-monospace; color:#bbb; margin-bottom:8px; font-size:15px; }
-
+  form.quick { display:flex; gap:8px; align-items:center; flex:1; }
+  form.quick input[type="text"] { flex:1; min-width:220px; background:#222; color:#eee; border:1px solid #333; border-radius:10px; padding:10px 12px; }
+  form.quick button { background:#222; color:#eee; border:1px solid #333; border-radius:10px; padding:10px 14px; cursor:pointer; }
   @media (max-width: 640px) {
     header .title { font-size:20px; }
     a.btn { font-size:18px; padding:12px 16px; border-radius:14px; }
@@ -888,6 +950,12 @@ def roots_template():
     <a class="btn" href="/">Back to gallery</a>
   </header>
   <div class="wrap">
+    <div class="toolbar">
+      <form class="quick" method="get" action="/roots">
+        <input type="text" name="p" placeholder="Type an absolute path… (e.g., D:\DOWN or /Volumes/Drive)" value="">
+        <button type="submit">Browse</button>
+      </form>
+    </div>
     __BODY__
   </div>
 </body>
@@ -897,9 +965,9 @@ def roots_template():
 # ===== GAL:BEGIN_MAIN =====
 def main():
     global PORT, CURRENT_ROOT, ALLOWED_BASES
-    if is_storage_path(CURRENT_ROOT):
+    if is_android_env() and is_storage_path(CURRENT_ROOT):
         CURRENT_ROOT = ANDROID_STORAGE
-    ALLOWED_BASES = termux_candidates()
+    ALLOWED_BASES = termux_candidates() if is_android_env() else desktop_candidates()
 
     if len(sys.argv) >= 3 and sys.argv[1] in ('-p','--port'):
         try: PORT = int(sys.argv[2])
