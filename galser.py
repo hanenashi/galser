@@ -5,7 +5,7 @@
 # - Subfolder browsing (⋯ up)
 # - Two gallery modes: thumbnails (images only) or file list (all files + sizes)
 # - Sorting for both modes: by name or size, ascending/descending (server-side, URL + localStorage)
-# - Settings (⚙️): view mode, sort options, live thumbnail-size slider (persisted), link to folder picker
+# - Settings (⚙️): view mode, sort options, live thumbnail-size slider (persisted), link to folder picker, show hidden files
 # - Built-in folder picker (/roots) to change BASE at runtime
 #   * Android: canonicalizes /sdcard → /storage/emulated/0 and labels it “Storage”
 # - Fullscreen viewer:
@@ -65,6 +65,9 @@ def display_label(path):
     rp = canonical_storage(path)
     if rp == ANDROID_STORAGE:
         return "Storage"
+    # Pretty drive labels on Windows (e.g., "C:")
+    if os.name == 'nt' and re.match(r'^[A-Z]:\\$', rp):
+        return rp[:2]
     base = os.path.basename(rp)
     return base if base else rp
 # ===== GAL:END_ANDROID_STORAGE_CANON =====
@@ -203,9 +206,27 @@ def fmt_size(n: int) -> str:
     # ===== GAL:END_FMT_SIZE =====
 # ===== GAL:END_SORT_AND_PATH_UTILS =====
 
+# ===== GAL:BEGIN_HIDDEN_HELPER =====
+def _is_hidden_entry(entry):
+    name = entry.name
+    # Dotfiles everywhere
+    if name.startswith('.'):
+        return True
+    # Windows hidden attribute (Python 3.8+: st_file_attributes)
+    if os.name == 'nt':
+        try:
+            st = entry.stat(follow_symlinks=False)
+            attr = getattr(st, 'st_file_attributes', 0)
+            # FILE_ATTRIBUTE_HIDDEN = 0x2
+            return bool(attr & 0x2)
+        except Exception:
+            return False
+    return False
+# ===== GAL:END_HIDDEN_HELPER =====
+
 # ===== GAL:BEGIN_DIR_CACHE =====
 @lru_cache(maxsize=512)
-def scan_dir(rel):
+def scan_dir(rel, show_hidden=False):
     """Return (subdirs, files_info) where files_info = list of (name, size, is_image)."""
     folder = safe_join(rel)
     subs, files = [], []
@@ -213,9 +234,9 @@ def scan_dir(rel):
         with os.scandir(folder) as it:
             for e in it:
                 name = e.name
-                if name.startswith('.'):
-                    continue
                 try:
+                    if not show_hidden and _is_hidden_entry(e):
+                        continue
                     if e.is_dir():
                         subs.append(name)
                     elif e.is_file():
@@ -233,8 +254,8 @@ def scan_dir(rel):
     return subs, files
 
 @lru_cache(maxsize=512)
-def list_dir(rel):
-    subs, files = scan_dir(rel)
+def list_dir(rel, show_hidden=False):
+    subs, files = scan_dir(rel, show_hidden)
     imgs = [name for (name, _sz, is_img) in files if is_img]
     imgs.sort(key=human_sort_key)
     return subs, imgs
@@ -262,9 +283,9 @@ def get_lan_ip():
 # ===== GAL:BEGIN_HTTP_HANDLER =====
 class Handler(http.server.SimpleHTTPRequestHandler):
     # Routes:
-    #   /               → gallery (grid or list; ?d=&view=&sort=&dir=)
-    #   /view           → viewer (requires ?d=&i= and carries view/sort/dir)
-    #   /raw            → file bytes (images only)
+    #   /               → gallery (grid or list; ?d=&view=&sort=&dir=&hidden=)
+    #   /view           → viewer (requires ?d=&i= and carries view/sort/dir/hidden)
+    #   /raw            → file bytes (images only; respects hidden)
     #   /refresh        → clear caches and redirect back
     #   /roots          → simple file commander to pick new base folder
     #   /setroot        → set CURRENT_ROOT (GET ?path=ABS_PATH) if allowed
@@ -294,12 +315,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def _serve_gallery(self, query):
         qs = urllib.parse.parse_qs(query or '')
         rel   = norm_rel(qs.get('d',[''])[0])
-        view  = (qs.get('view',['thumbs'])[0] or 'thumbs')  # 'thumbs' | 'list'
-        sort  = (qs.get('sort',['name'])[0] or 'name')      # 'name'   | 'size'
-        sdir  = (qs.get('dir', ['asc'])[0]  or 'asc')       # 'asc'    | 'desc'
+        view  = (qs.get('view',['thumbs'])[0] or 'thumbs')   # 'thumbs' | 'list'
+        sort  = (qs.get('sort',['name'])[0] or 'name')       # 'name'   | 'size'
+        sdir  = (qs.get('dir', ['asc'])[0]  or 'asc')        # 'asc'    | 'desc'
+        hidden = (qs.get('hidden', ['0'])[0] == '1')         # False | True
         desc  = (sdir == 'desc')
 
-        subdirs, files = scan_dir(rel)
+        subdirs, files = scan_dir(rel, hidden)
 
         # ----- sorting for files -----
         def sort_key_name(item):  # (name, size, is_image)
@@ -320,7 +342,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 parent = rel.rsplit('/',1)[0] if '/' in rel else ''
                 cards.append(
                     '<a class="card folder" href="/?' +
-                    urllib.parse.urlencode({'d': parent, 'view': view, 'sort': sort, 'dir': sdir}) +
+                    urllib.parse.urlencode({'d': parent, 'view': view, 'sort': sort, 'dir': sdir, 'hidden': '1' if hidden else '0'}) +
                     '" title="Up"><div class="thumb"><div class="folder-emoji">⋯</div></div><div class="cap">.. (up)</div></a>'
                 )
             # Folders
@@ -329,13 +351,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 title = html_escape(name)
                 cards.append(
                     '<a class="card folder" href="/?' +
-                    urllib.parse.urlencode({'d': next_rel, 'view': view, 'sort': sort, 'dir': sdir}) +
+                    urllib.parse.urlencode({'d': next_rel, 'view': view, 'sort': sort, 'dir': sdir, 'hidden': '1' if hidden else '0'}) +
                     f'" title="{title}"><div class="thumb"><div class="folder-emoji">📁</div></div><div class="cap">{title}</div></a>'
                 )
             # Images
             for idx, name in enumerate(images_sorted):
-                vq = urllib.parse.urlencode({'d': rel, 'i': str(idx), 'view': view, 'sort': sort, 'dir': sdir})
-                src_q = urllib.parse.urlencode({'d': rel, 'n': name})
+                vq    = urllib.parse.urlencode({'d': rel, 'i': str(idx), 'view': view, 'sort': sort, 'dir': sdir, 'hidden': '1' if hidden else '0'})
+                src_q = urllib.parse.urlencode({'d': rel, 'n': name, 'hidden': '1' if hidden else '0'})
                 title = html_escape(name)
                 loading = "eager" if idx < 8 else "lazy"
                 cards.append(
@@ -349,7 +371,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # Up row
             if rel:
                 parent = rel.rsplit('/',1)[0] if '/' in rel else ''
-                up_q = urllib.parse.urlencode({'d': parent, 'view': view, 'sort': sort, 'dir': sdir})
+                up_q = urllib.parse.urlencode({'d': parent, 'view': view, 'sort': sort, 'dir': sdir, 'hidden': '1' if hidden else '0'})
                 list_rows.append(
                     '<div class="row folder"><a class="fname" href="/?' + up_q + '" title="Up">⋯ (up)</a><span class="fsize"></span></div>'
                 )
@@ -357,7 +379,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             for name in subdirs:
                 next_rel = f"{rel}/{name}" if rel else name
                 title = html_escape(name)
-                q = urllib.parse.urlencode({'d': next_rel, 'view': view, 'sort': sort, 'dir': sdir})
+                q = urllib.parse.urlencode({'d': next_rel, 'view': view, 'sort': sort, 'dir': sdir, 'hidden': '1' if hidden else '0'})
                 list_rows.append(
                     '<div class="row folder"><a class="fname" href="/?' + q + '" title="' + title + '">📁 ' + title + '</a><span class="fsize"></span></div>'
                 )
@@ -367,7 +389,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 title = html_escape(name)
                 sz = html_escape(fmt_size(size))
                 if is_img:
-                    vq = urllib.parse.urlencode({'d': rel, 'i': str(img_index[name]), 'view': view, 'sort': sort, 'dir': sdir})
+                    vq = urllib.parse.urlencode({'d': rel, 'i': str(img_index[name]), 'view': view, 'sort': sort, 'dir': sdir, 'hidden': '1' if hidden else '0'})
                     list_rows.append(
                         '<div class="row file"><a class="fname" href="/view?' + vq + '" title="' + title + '">' + title + '</a><span class="fsize">' + sz + '</span></div>'
                     )
@@ -375,9 +397,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     list_rows.append(
                         '<div class="row file"><span class="fname" title="' + title + '">' + title + '</span><span class="fsize">' + sz + '</span></div>'
                     )
-
-        disp_path = '/' + rel if rel else '/'
-        disp_abs = safe_join(rel)
 
         cards_html = ''.join(cards)
         list_html = ''.join(list_rows)
@@ -471,6 +490,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         </select>
       </div>
       <div class="row set">
+        <label for="hiddenChk">Show hidden files</label>
+        <input type="checkbox" id="hiddenChk">
+      </div>
+      <div class="row set">
         <label for="thumbRange">Thumbnail size</label>
         <input type="range" id="thumbRange" min="60" max="480" step="1">
         <input type="number" id="thumbSize" min="60" max="480" step="10">
@@ -489,7 +512,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
   <!-- GAL:BEGIN_GALLERY_SCRIPT -->
   <script>
-    const CURRENT_VIEW="__VIEW__", CURRENT_SORT="__SORT__", CURRENT_DIR="__DIR__";
+    const CURRENT_VIEW="__VIEW__", CURRENT_SORT="__SORT__", CURRENT_DIR="__DIR__", CURRENT_HIDDEN="__HIDDEN__";
     const CURR_REL="__REL__";
 
     const LS = window.localStorage, DEF_SIZE = 140, MIN_SIZE = 60, MAX_SIZE = 480;
@@ -500,11 +523,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     const overlay=document.getElementById('overlay'), gearBtn=document.getElementById('gearBtn'),
           thumbRange=document.getElementById('thumbRange'), thumbSizeInp=document.getElementById('thumbSize'),
           modeSel=document.getElementById('modeSel'), sortSel=document.getElementById('sortSel'), dirSel=document.getElementById('dirSel'),
+          hiddenChk=document.getElementById('hiddenChk'),
           applyBtn=document.getElementById('applyBtn'), closeBtn=document.getElementById('closeBtn');
 
     function openOverlay(){
       const v=getThumbSize(); thumbRange.value=v; thumbSizeInp.value=v;
       modeSel.value = CURRENT_VIEW; sortSel.value = CURRENT_SORT; dirSel.value = CURRENT_DIR;
+      hiddenChk.checked = (localStorage.getItem('galser.hidden') ?? CURRENT_HIDDEN) === '1';
       overlay.style.display='flex';
     }
     function closeOverlay(){ overlay.style.display='none'; }
@@ -520,21 +545,24 @@ class Handler(http.server.SimpleHTTPRequestHandler):
       LS.setItem('galser.view', modeSel.value);
       LS.setItem('galser.sort', sortSel.value);
       LS.setItem('galser.dir',  dirSel.value);
+      LS.setItem('galser.hidden', hiddenChk.checked ? '1' : '0');
       const q = new URLSearchParams(location.search);
       q.set('d', CURR_REL);
       q.set('view', modeSel.value);
       q.set('sort', sortSel.value);
       q.set('dir',  dirSel.value);
+      q.set('hidden', hiddenChk.checked ? '1' : '0');
       location.href = '/?'+q.toString();
     });
 
     (function bootstrapURL(){
       const q = new URLSearchParams(location.search);
-      if (!q.has('view') || !q.has('sort') || !q.has('dir')){
+      if (!q.has('view') || !q.has('sort') || !q.has('dir') || !q.has('hidden')){
         const v = LS.getItem('galser.view') || CURRENT_VIEW;
         const s = LS.getItem('galser.sort') || CURRENT_SORT;
         const d = LS.getItem('galser.dir')  || CURRENT_DIR;
-        q.set('view', v); q.set('sort', s); q.set('dir', d);
+        const h = LS.getItem('galser.hidden') || CURRENT_HIDDEN || '0';
+        q.set('view', v); q.set('sort', s); q.set('dir', d); q.set('hidden', h);
         history.replaceState({},'', '/?'+q.toString());
       }
     })();
@@ -559,7 +587,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 .replace('__VIEW__', html_escape(view))
                 .replace('__SORT__', html_escape(sort))
                 .replace('__DIR__',  html_escape(sdir))
-                .replace('__REL__',  html_escape(rel)))
+                .replace('__REL__',  html_escape(rel))
+                .replace('__HIDDEN__', '1' if hidden else '0'))
         self._send_html(html)
 # ===== GAL:END_GALLERY_HANDLER =====
 
@@ -574,9 +603,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         sort  = (qs.get('sort',['name'])[0] or 'name')
         sdir  = (qs.get('dir', ['asc'])[0]  or 'asc')
         view_mode = (qs.get('view',['thumbs'])[0] or 'thumbs')
+        hidden = (qs.get('hidden', ['0'])[0] == '1')
         desc  = (sdir == 'desc')
 
-        _subdirs, files = scan_dir(rel)
+        _subdirs, files = scan_dir(rel, hidden)
         def sort_key_name(item): return human_sort_key(item[0])
         def sort_key_size(item): return (item[1], human_sort_key(item[0]))
         key = sort_key_size if sort == 'size' else sort_key_name
@@ -585,13 +615,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         if not images:
             self.send_response(302)
-            self.send_header('Location','/?'+urllib.parse.urlencode({'d':rel, 'view':view_mode, 'sort':sort, 'dir':sdir}))
+            self.send_header('Location','/?'+urllib.parse.urlencode({'d':rel, 'view':view_mode, 'sort':sort, 'dir':sdir, 'hidden': '1' if hidden else '0'}))
             self.end_headers()
             return
 
         idx = max(0, min(idx, len(images)-1))
-        urls = ["/raw?"+urllib.parse.urlencode({'d':rel,'n':name}) for name in images]
-        back_q = urllib.parse.urlencode({'d': rel, 'view': view_mode, 'sort': sort, 'dir': sdir})
+        urls = ["/raw?"+urllib.parse.urlencode({'d':rel,'n':name,'hidden':'1' if hidden else '0'}) for name in images]
+        back_q = urllib.parse.urlencode({'d': rel, 'view': view_mode, 'sort': sort, 'dir': sdir, 'hidden': '1' if hidden else '0'})
 
         # ===== GAL:BEGIN_VIEWER_PAGE =====
         tmpl = r'''<!doctype html>
@@ -782,10 +812,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         qs = urllib.parse.parse_qs(query or '')
         rel = norm_rel(qs.get('d',[''])[0])
         name = qs.get('n',[''])[0]
+        hidden = (qs.get('hidden', ['0'])[0] == '1')
         if not name:
             return self._send_status(400, b'bad request')
 
-        _, images = list_dir(rel)
+        _, images = list_dir(rel, hidden)
         if name not in images:
             return self._send_status(404, b'not found')
 
@@ -835,7 +866,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 with os.scandir(abs_base) as it:
                     for e in it:
                         if e.name.startswith('.'):
-                            continue
+                            # allow dotfolders if user wants them; we list all here, visibility is decided in gallery
+                            pass
                         if e.is_dir():
                             entries.append(e.name)
                 entries.sort(key=human_sort_key)
